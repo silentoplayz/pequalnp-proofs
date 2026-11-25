@@ -1,0 +1,127 @@
+name: Warm proof preflight
+
+on:
+  push:
+    branches: [codex/pnp-warm-20261125-1906]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    env:
+      PROOF_REF: refs/heads/codex/pnp-warm-input-20261125-1906
+      GAPS_URL: https://data.pequalnp.com/data/desk/gaps.json
+      ELAN_VERSION: v4.4.0
+      ELAN_SHA256: 0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2
+    steps:
+      - name: Fetch pinned upstream base
+        run: |
+          set -eu
+          git init -q .
+          git fetch -q --depth 2 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD^
+          git rev-parse HEAD > "$RUNNER_TEMP/proof-base"
+      - name: Install the pinned Lean toolchain
+        run: |
+          set -eu
+          git show 'HEAD:.github/scripts/install-elan.sh' > "$RUNNER_TEMP/install-elan.sh"
+          sh "$RUNNER_TEMP/install-elan.sh" "$ELAN_VERSION" "$ELAN_SHA256" "$HOME/.elan" "$(cat lean/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch the prebuilt Mathlib
+        working-directory: lean
+        run: lake exe cache get
+
+      - name: Swap space for the verifier
+        run: |
+          set -eu
+          candidate=$(df -m --output=avail,target / /mnt 2>/dev/null | awk 'NR>1' | sort -rn | head -1)
+          available=$(printf '%s\n' "$candidate" | awk '{print $1}')
+          mountpoint=$(printf '%s\n' "$candidate" | awk '{print $2}')
+          capacity=$((available - 4500))
+          [ "$capacity" -le 6144 ] || capacity=6144
+          if [ "$capacity" -ge 2048 ]; then
+            swap_file="${mountpoint%/}/pnp-proof-swap"
+            sudo fallocate -l "${capacity}M" "$swap_file"
+            sudo chmod 600 "$swap_file"
+            sudo mkswap -q "$swap_file"
+            sudo swapon "$swap_file"
+          fi
+          free -m
+
+      - name: Prebuild verifier and definitions
+        working-directory: lean
+        run: |
+          set -eu
+          cap=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) - 1572864 ))
+          [ "$cap" -le 11534336 ] || cap=11534336
+          sudo systemd-run --quiet --scope --collect -p MemoryMax="${cap}K" --uid="$(id -u)" --gid="$(id -g)" \
+            env HOME="$HOME" PATH="$PATH" LAKE_ARTIFACT_CACHE=false PEQUALNP_BUILD_SLOTS=1 \
+            taskset -c 0,1 ../tools/build.sh checklemma +PEqualNP.Defs
+      - name: Check out one proof against the pinned base
+        run: |
+          set -eu
+          origin="https://github.com/${GITHUB_REPOSITORY}.git"
+          for attempt in $(seq 1 64); do
+            if git ls-remote --exit-code "$origin" "$PROOF_REF" >/dev/null; then
+              break
+            else
+              code=$?
+              [ "$code" -eq 2 ] || exit "$code"
+            fi
+            if [ "$attempt" -eq 64 ]; then
+              echo 'No proof arrived during the warm runner window.'
+              exit 1
+            fi
+            sleep 8
+          done
+          git fetch -q --depth 2 "$origin" "$PROOF_REF"
+          proof_commit=$(git rev-parse FETCH_HEAD)
+          base=$(cat "$RUNNER_TEMP/proof-base")
+          test "$(git show -s --format=%P "$proof_commit")" = "$base"
+          diff=$(git diff --no-renames --name-status "$base" "$proof_commit")
+          file=$(printf '%s\n' "$diff" | cut -f 2)
+          test "$diff" = "$(printf 'A\t%s' "$file")"
+          printf '%s\n' "$file" | grep -Eq '^lean/PEqualNP/Outside/L_[a-z0-9_]+\.lean$'
+          git ls-tree "$proof_commit" -- "$file" | grep -q '^100644 blob '
+          git checkout -q --detach "$proof_commit"
+          printf 'FILE=%s\nPROOF_COMMIT=%s\n' "$file" "$proof_commit" >> "$GITHUB_ENV"
+      - name: The posted statement and the import rule
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/in"
+          curl -sSf --proto '=https' --max-redirs 0 --max-filesize 20000000 -o "$RUNNER_TEMP/in/gaps.json" "$GAPS_URL"
+          node .github/scripts/outside-guard.mjs gap-of-file "$RUNNER_TEMP/in/gaps.json" "$FILE" "$RUNNER_TEMP/in"
+          node .github/scripts/outside-guard.mjs imports "$FILE" "$RUNNER_TEMP/in/imports.json" "$FILE"
+          echo "gap: $(cat "$RUNNER_TEMP/in/gap.id")"
+
+      - name: Run the checker
+        timeout-minutes: 25
+        run: |
+          set -u
+          set +e
+          printf "PROOF_COMMIT %s\n" "$PROOF_COMMIT"
+          # Bound this independent hosted preflight to two cores and leave RAM for the runner.
+          cap=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) - 1572864 ))
+          [ "$cap" -le 11534336 ] || cap=11534336
+          sudo systemd-run --quiet --scope --collect -p MemoryMax="${cap}K" --uid="$(id -u)" --gid="$(id -g)" \
+            env HOME="$HOME" PATH="$PATH" taskset -c 0,1 timeout -k 30 1200 \
+            node tools/check-lean.mjs "$FILE" "$RUNNER_TEMP/in/statement.txt" check > "$RUNNER_TEMP/out" 2> "$RUNNER_TEMP/err"
+          code=$?
+          case "$code" in 124|137) echo "the checker was stopped after 20 minutes" >> "$RUNNER_TEMP/err" ;; esac
+          pkill -KILL -f "lean/.lake/build/bin/checklemma" || true
+          # The output can quote the proof file, so it is printed with workflow commands switched off.
+          stop="stop-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$stop"
+          tail -n 40 "$RUNNER_TEMP/err"
+          tail -n 60 "$RUNNER_TEMP/out"
+          echo "::$stop::"
+          case "$code" in
+            0) echo "ADVISORY VERDICT: ACCEPTED (advisory only: the check that counts runs from the base branch)" ;;
+            1) echo "ADVISORY VERDICT: REJECTED (the last line above says why)" ;;
+            *) echo "ADVISORY VERDICT: the checker could not run (exit $code)" ;;
+          esac
+          exit "$code"
