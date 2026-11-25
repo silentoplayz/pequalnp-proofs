@@ -1,0 +1,91 @@
+name: Proof preflight
+
+on:
+  push:
+    branches: [codex/pnp-preflight-13193]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    env:
+      FILE: lean/PEqualNP/Outside/L_meta_13193.lean
+      GAPS_URL: https://data.pequalnp.com/data/desk/gaps.json
+      ELAN_VERSION: v4.4.0
+      ELAN_SHA256: 0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2
+    steps:
+      - name: Fetch this exact commit
+        run: |
+          set -eu
+          git init -q .
+          git fetch -q --depth 3 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git diff --name-status HEAD~2 HEAD^1)" = "$(printf 'A\t%s' "$FILE")"
+          test "$(git rev-parse "HEAD:$FILE")" = "$(git rev-parse "HEAD^1:$FILE")"
+      - name: The posted statement and the import rule
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/in"
+          curl -sSf --proto '=https' --max-redirs 0 --max-filesize 20000000 -o "$RUNNER_TEMP/in/gaps.json" "$GAPS_URL"
+          node .github/scripts/outside-guard.mjs gap-of-file "$RUNNER_TEMP/in/gaps.json" "$FILE" "$RUNNER_TEMP/in"
+          node .github/scripts/outside-guard.mjs imports "$FILE" "$RUNNER_TEMP/in/imports.json" "$FILE"
+          echo "gap: $(cat "$RUNNER_TEMP/in/gap.id")"
+
+      - name: Install the pinned Lean toolchain
+        run: |
+          set -eu
+          # The installer pinned by release and sha256 (.github/scripts/install-elan.sh, as in authoritative.yml).
+          # The script is read from the BASE side of the merge (HEAD^1), never from the pull request's copy.
+          # (A fork can still rewrite this whole file in its own pull_request run; that is why this check is advisory.)
+          git show 'HEAD~2:.github/scripts/install-elan.sh' > "$RUNNER_TEMP/install-elan.sh"
+          sh "$RUNNER_TEMP/install-elan.sh" "$ELAN_VERSION" "$ELAN_SHA256" "$HOME/.elan" "$(cat lean/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch the prebuilt Mathlib
+        working-directory: lean
+        run: lake exe cache get
+
+      - name: Swap space for the verifier
+        run: |
+          set -eu
+          candidate=$(df -m --output=avail,target / /mnt 2>/dev/null | awk 'NR>1' | sort -rn | head -1)
+          available=$(printf '%s\n' "$candidate" | awk '{print $1}')
+          mountpoint=$(printf '%s\n' "$candidate" | awk '{print $2}')
+          capacity=$((available - 4500))
+          [ "$capacity" -le 6144 ] || capacity=6144
+          if [ "$capacity" -ge 2048 ]; then
+            swap_file="${mountpoint%/}/pnp-proof-swap"
+            sudo fallocate -l "${capacity}M" "$swap_file"
+            sudo chmod 600 "$swap_file"
+            sudo mkswap -q "$swap_file"
+            sudo swapon "$swap_file"
+          fi
+          free -m
+
+      - name: Run the checker
+        timeout-minutes: 25
+        run: |
+          set -u
+          # Bound this independent hosted preflight to two cores and leave RAM for the runner.
+          cap=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) - 1572864 ))
+          [ "$cap" -le 11534336 ] || cap=11534336
+          sudo systemd-run --quiet --scope --collect -p MemoryMax="${cap}K" --uid="$(id -u)" --gid="$(id -g)" \
+            env HOME="$HOME" PATH="$PATH" taskset -c 0,1 timeout -k 30 1200 \
+            node tools/check-lean.mjs "$FILE" "$RUNNER_TEMP/in/statement.txt" check > "$RUNNER_TEMP/out" 2> "$RUNNER_TEMP/err"
+          code=$?
+          case "$code" in 124|137) echo "the checker was stopped after 20 minutes" >> "$RUNNER_TEMP/err" ;; esac
+          pkill -KILL -f "lean/.lake/build/bin/checklemma" || true
+          # The output can quote the proof file, so it is printed with workflow commands switched off.
+          stop="stop-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$stop"
+          tail -n 40 "$RUNNER_TEMP/err"
+          tail -n 60 "$RUNNER_TEMP/out"
+          echo "::$stop::"
+          case "$code" in
+            0) echo "ADVISORY VERDICT: ACCEPTED (advisory only: the check that counts runs from the base branch)" ;;
+            1) echo "ADVISORY VERDICT: REJECTED (the last line above says why)" ;;
+            *) echo "ADVISORY VERDICT: the checker could not run (exit $code)" ;;
+          esac
+          exit "$code"
